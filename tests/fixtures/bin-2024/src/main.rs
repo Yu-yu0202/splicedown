@@ -1,9 +1,19 @@
 mod utils;
 
+use lib_2024_a::a_report;
+use lib_2024_a::nested::deep::deep_mul;
+use lib_2024_b::{b_calc, b_macro, b_macro_arg, b_use_internal};
 use utils::mul;
 
 fn main() {
-    println!("Hello World!");
-    println!("1 + 1 = {}", utils::add(1, 1));
-    println!("2 * 3 = {}", mul(2, 3));
+    let s = utils::add(1, 2);
+    let s2 = crate::utils::add(3, 4);
+    let p = mul(2, 3);
+    let b = b_calc(10, 20);
+    let d = deep_mul(3, 4);
+    let m = a_report!(s + s2);
+    let m2 = b_macro(d as i64);
+    let m3 = b_macro_arg(b);
+    let m4 = b_use_internal(b);
+    println!("{s} {p} {b} {d} {m} {m2} {m3} {m4}");
 }
