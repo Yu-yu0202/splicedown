@@ -1,0 +1,6 @@
+[package]
+name = "lib-2024-c"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]

@@ -19,3 +19,7 @@ pub fn b_macro_arg(v: i64) -> i64 {
 pub fn b_use_internal(v: i64) -> i64 {
     b_internal!(v)
 }
+
+pub fn c_const() -> i64 {
+    lib_2024_c::C_CONST
+}

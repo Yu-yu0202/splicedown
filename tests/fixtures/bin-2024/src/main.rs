@@ -20,5 +20,6 @@ fn main() {
     let m2 = b_macro(d as i64);
     let m3 = b_macro_arg(b);
     let m4 = b_use_internal(b);
-    println!("{s} {p} {b} {d} {m} {m2} {m3} {m4}");
+    let c = lib_2024_b::c_const();
+    println!("{s} {p} {b} {d} {m} {m2} {m3} {m4} {c}");
 }

@@ -20,7 +20,12 @@ name = "lib-2024-b"
 version = "0.0.0"
 dependencies = [
  "lib-2024-a",
+ "lib-2024-c",
 ]
+
+[[package]]
+name = "lib-2024-c"
+version = "0.0.0"
 
 [[package]]
 name = "lib-pm"

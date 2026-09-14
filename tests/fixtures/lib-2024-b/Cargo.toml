@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 lib-2024-a = { path = "../lib-2024-a" }
+lib-2024-c = { version = "0.0.0", path = "../lib-2024-c" }

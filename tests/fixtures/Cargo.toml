@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["bin-2024", "lib-2024-a", "lib-2024-b", "lib-pm"]
+members = ["bin-2024", "lib-2024-a", "lib-2024-b", "lib-2024-c", "lib-pm"]
