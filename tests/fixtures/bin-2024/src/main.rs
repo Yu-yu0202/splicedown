@@ -3,7 +3,12 @@ mod utils;
 use lib_2024_a::a_report;
 use lib_2024_a::nested::deep::deep_mul;
 use lib_2024_b::{b_calc, b_macro, b_macro_arg, b_use_internal};
+use lib_pm::PmDummy;
 use utils::mul;
+
+#[allow(unused)]
+#[derive(PmDummy)]
+struct Dummy;
 
 fn main() {
     let s = utils::add(1, 2);

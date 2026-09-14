@@ -5,6 +5,11 @@ version = 4
 [[package]]
 name = "bin-2024"
 version = "0.0.0"
+dependencies = [
+ "lib-2024-a",
+ "lib-2024-b",
+ "lib-pm",
+]
 
 [[package]]
 name = "lib-2024-a"
@@ -16,3 +21,7 @@ version = "0.0.0"
 dependencies = [
  "lib-2024-a",
 ]
+
+[[package]]
+name = "lib-pm"
+version = "0.0.0"

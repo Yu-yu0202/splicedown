@@ -1,0 +1,9 @@
+[package]
+name = "lib-pm"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
