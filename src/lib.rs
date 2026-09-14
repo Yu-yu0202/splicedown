@@ -1,5 +1,6 @@
 mod cli;
 mod metadata;
+mod util;
 
 use anyhow::Result;
 
