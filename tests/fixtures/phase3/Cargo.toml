@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["bin", "lib-a", "lib-b", "lib-c"]
