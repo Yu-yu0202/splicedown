@@ -3,6 +3,7 @@ mod check;
 mod cli;
 mod inline;
 mod metadata;
+mod rewrite;
 mod util;
 
 use crate::metadata::Plan;
@@ -31,14 +32,17 @@ fn execute(cli: cli::Cli) -> Result<()> {
 }
 
 fn bundle(plan: &Plan) -> Result<String> {
-    let main = inline::load_and_inline(plan.entry.src.as_std_path())
+    let mut main = inline::load_and_inline(plan.entry.src.as_std_path())
         .with_context(|| format!("failed to load entry {}", plan.entry.src))?;
+    rewrite::rewrite(&mut main, &plan.entry.extern_map, None);
+
     let deps = plan
         .deps
         .iter()
         .map(|dep| {
-            let file = inline::load_and_inline(dep.lib_src.as_std_path())
+            let mut file = inline::load_and_inline(dep.lib_src.as_std_path())
                 .with_context(|| format!("failed to load dependency {}", dep.pkg.name))?;
+            rewrite::rewrite(&mut file, &dep.extern_map, Some(&dep.mangled));
             Ok((dep.mangled.clone(), file))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -107,6 +111,26 @@ mod tests {
 
     struct TestProject {
         root: PathBuf,
+    }
+
+    struct TempOutput {
+        path: PathBuf,
+    }
+
+    impl TempOutput {
+        fn new(label: &str) -> Self {
+            let id = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("splicedown-{label}-{}-{id}.rs", std::process::id()));
+            let _ = fs::remove_file(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TempOutput {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 
     impl TestProject {
@@ -190,5 +214,29 @@ mod tests {
 
         assert!(error.to_string().contains("cargo check"));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn phase3_fixture_rewrites_paths_and_passes_check() {
+        let output = TempOutput::new("phase3");
+        let root = fixture("phase3");
+        let cli = cli::Cli {
+            entry: root.join("bin/src/main.rs"),
+            manifest_path: Some(root.join("bin/Cargo.toml")),
+            output: Some(output.path.clone()),
+            exclude: Vec::new(),
+            no_check: false,
+            keep_check_dir: false,
+        };
+
+        execute(cli).unwrap();
+
+        let bundled = fs::read_to_string(&output.path).unwrap();
+        assert!(bundled.contains("self as phase3_a"));
+        assert!(bundled.contains("crate::__splicedown_phase3_a"));
+        assert!(bundled.contains("crate::__splicedown_phase3_b"));
+        assert!(bundled.contains("crate::__splicedown_phase3_c"));
+        assert!(bundled.contains("super::nested_value()"));
+        assert!(bundled.contains("crate::utils::add(3, 4)"));
     }
 }
