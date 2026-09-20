@@ -396,5 +396,4 @@ mod tests {
         assert!(bundled.contains("struct Dummy"));
         assert!(bundled.starts_with("// bundled by splicedown v"));
     }
-
 }
