@@ -2,6 +2,8 @@
 name = "lib-2024-b"
 version = "0.0.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://example.com/lib-2024-b"
 
 [dependencies]
 lib-2024-a = { path = "../lib-2024-a" }
