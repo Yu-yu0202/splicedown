@@ -3,6 +3,8 @@ use syn::{File, Ident, Item, ItemMod, parse_quote};
 pub(crate) fn assemble(mut main: File, deps: Vec<(Ident, File)>) -> File {
     let mut items = Vec::with_capacity(deps.len() + main.items.len());
 
+    items.append(&mut main.items);
+
     for (name, dep) in deps {
         let mut module: ItemMod = parse_quote!(mod #name {});
         module.attrs = dep.attrs;
@@ -10,7 +12,6 @@ pub(crate) fn assemble(mut main: File, deps: Vec<(Ident, File)>) -> File {
         items.push(Item::Mod(module));
     }
 
-    items.append(&mut main.items);
     main.items = items;
     main.attrs.insert(
         0,
@@ -26,7 +27,7 @@ mod tests {
     use syn::{AttrStyle, Item};
 
     #[test]
-    fn dependencies_precede_entry_and_keep_inner_attributes() {
+    fn entry_precedes_dependencies_and_keeps_inner_attributes() {
         let main = syn::parse_file("#![allow(clippy::all)]\nmod utils {}\nfn main() {}").unwrap();
         let dep = syn::parse_file("#![no_implicit_prelude]\npub fn value() -> i32 { 1 }").unwrap();
         let name = Ident::new("__splicedown_dep", Span::call_site());
@@ -35,14 +36,14 @@ mod tests {
 
         assert_eq!(assembled.attrs.len(), 2);
         assert!(matches!(assembled.attrs[0].style, AttrStyle::Inner(_)));
-        let Item::Mod(dep_mod) = &assembled.items[0] else {
-            panic!("first item was not a dependency module");
+        assert!(matches!(&assembled.items[0], Item::Mod(m) if m.ident == "utils"));
+        assert!(matches!(&assembled.items[1], Item::Fn(f) if f.sig.ident == "main"));
+        let Item::Mod(dep_mod) = &assembled.items[2] else {
+            panic!("last item was not a dependency module");
         };
         assert_eq!(dep_mod.ident, name);
         assert!(matches!(dep_mod.attrs[0].style, AttrStyle::Inner(_)));
         assert_eq!(dep_mod.content.as_ref().unwrap().1.len(), 1);
-        assert!(matches!(&assembled.items[1], Item::Mod(m) if m.ident == "utils"));
-        assert!(matches!(&assembled.items[2], Item::Fn(f) if f.sig.ident == "main"));
     }
 
     #[test]
