@@ -5,6 +5,7 @@ mod header;
 mod inline;
 mod macros;
 mod metadata;
+mod minify;
 mod preset;
 mod rewrite;
 mod util;
@@ -14,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use tracing::info;
 pub async fn run() -> Result<()> {
     execute(cli::parse())
 }
@@ -26,6 +28,22 @@ fn execute(cli: cli::Cli) -> Result<()> {
         .context("[metadata] failed to collect the dependency graph")?;
 
     let mut source = bundle(&plan).context("[bundle] failed to build the bundled source")?;
+
+    let minify = minify::Options {
+        dead_code: cli.minify_enabled(),
+        test_code: cli.minify_test_enabled(),
+    };
+    if minify.dead_code || minify.test_code {
+        let manifest = check::manifest_toml(&plan.skip_pkgs)
+            .context("[minify] failed to prepare the validation manifest")?;
+        let result = minify::run(&source, &manifest, minify)
+            .context("[minify] failed to remove unused bundled items")?;
+        info!(
+            "minified bundle: removed {} items in {} compiler passes",
+            result.removed_items, result.passes
+        );
+        source = result.source;
+    }
 
     let bundled_deps = bundled_deps_in_source(&plan, &source)?;
     source = prepend_header(&source, &header::render(&bundled_deps));
