@@ -5,6 +5,7 @@ mod header;
 mod inline;
 mod macros;
 mod metadata;
+mod preset;
 mod rewrite;
 mod util;
 
@@ -208,6 +209,11 @@ mod tests {
                 manifest_path: Some(self.root.join("Cargo.toml")),
                 output: Some(output),
                 exclude: Vec::new(),
+                exclude_preset: Vec::new(),
+                minify: false,
+                no_minify: true,
+                minify_test: false,
+                no_minify_test: true,
                 no_check: false,
                 keep_check_dir: false,
             }
@@ -282,6 +288,11 @@ mod tests {
             manifest_path: Some(root.join("bin/Cargo.toml")),
             output: Some(output.path.clone()),
             exclude: Vec::new(),
+            exclude_preset: Vec::new(),
+            minify: false,
+            no_minify: true,
+            minify_test: false,
+            no_minify_test: true,
             no_check: false,
             keep_check_dir: false,
         };
