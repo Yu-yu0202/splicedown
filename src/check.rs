@@ -18,8 +18,10 @@ pub(crate) fn run(source: &str, skip_pkgs: &[Package], keep_dir: bool) -> Result
     // Generate the manifest before creating the temporary directory. In
     // particular, an unsupported git dependency should fail without leaving
     // an otherwise empty check directory behind.
-    let manifest = manifest_toml(skip_pkgs)?;
-    let check_dir = CheckDir::create(keep_dir)?;
+    let manifest =
+        manifest_toml(skip_pkgs).context("[cargo-check] failed to generate the check manifest")?;
+    let check_dir =
+        CheckDir::create(keep_dir).context("[cargo-check] failed to create the check directory")?;
     let src_dir = check_dir.path().join("src");
 
     fs::create_dir(&src_dir).with_context(|| format!("failed to create {}", src_dir.display()))?;
@@ -34,17 +36,25 @@ pub(crate) fn run(source: &str, skip_pkgs: &[Package], keep_dir: bool) -> Result
 
     let output = Command::new("cargo")
         .arg("check")
+        .arg("--quiet")
         .arg("--manifest-path")
         .arg(&manifest_path)
         .current_dir(check_dir.path())
         .output()
-        .with_context(|| "failed to execute cargo check")?;
-
-    forward_cargo_output(&output);
+        .with_context(|| "[cargo-check] failed to execute cargo check")?;
 
     if !output.status.success() {
-        bail!("cargo check failed ({})", status_description(&output));
+        forward_failure_output(&output);
+        bail!(
+            "[cargo-check] cargo check failed ({})\n{}",
+            status_description(&output),
+            failure_hint(check_dir.path(), keep_dir)
+        );
     }
+
+    // `--quiet` suppresses Cargo's progress messages while leaving compiler
+    // diagnostics such as warnings available on stderr.
+    forward_diagnostics(&output);
 
     Ok(())
 }
@@ -163,12 +173,35 @@ fn toml_string(value: &str) -> String {
     result
 }
 
-fn forward_cargo_output(output: &Output) {
+/// Forward captured cargo output only when the check failed.
+///
+/// A successful check is intentionally silent at Cargo's level: `--quiet`
+/// suppresses progress messages while compiler diagnostics remain visible.
+/// On failure, both streams are sent to stderr so rustc and Cargo diagnostics
+/// stay visible in one place.
+fn forward_failure_output(output: &Output) {
     if !output.stdout.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stdout));
     }
     if !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+fn forward_diagnostics(output: &Output) {
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+fn failure_hint(check_dir: &Path, keep_dir: bool) -> String {
+    if keep_dir {
+        format!(
+            "hint: inspect the generated crate at {}",
+            check_dir.display()
+        )
+    } else {
+        "hint: rerun with --keep-check-dir to inspect the generated crate".to_owned()
     }
 }
 
@@ -247,7 +280,7 @@ impl Drop for CheckDir {
 mod tests {
     use super::*;
     use cargo_metadata::MetadataCommand;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fixture_manifest() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin-2024/Cargo.toml")
@@ -315,5 +348,19 @@ mod tests {
             path
         };
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn cargo_check_failure_hint_explains_how_to_keep_generated_source() {
+        let path = Path::new("splicedown-check-example");
+
+        assert_eq!(
+            failure_hint(path, false),
+            "hint: rerun with --keep-check-dir to inspect the generated crate"
+        );
+        assert_eq!(
+            failure_hint(path, true),
+            "hint: inspect the generated crate at splicedown-check-example"
+        );
     }
 }
