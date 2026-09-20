@@ -2,6 +2,7 @@ mod assemble;
 mod check;
 mod cli;
 mod inline;
+mod macros;
 mod metadata;
 mod rewrite;
 mod util;
@@ -35,6 +36,7 @@ fn bundle(plan: &Plan) -> Result<String> {
     let mut main = inline::load_and_inline(plan.entry.src.as_std_path())
         .with_context(|| format!("failed to load entry {}", plan.entry.src))?;
     rewrite::rewrite(&mut main, &plan.entry.extern_map, None);
+    macros::rewrite_macro_tokens(&mut main, &plan.entry.extern_map, None);
 
     let deps = plan
         .deps
@@ -43,6 +45,13 @@ fn bundle(plan: &Plan) -> Result<String> {
             let mut file = inline::load_and_inline(dep.lib_src.as_std_path())
                 .with_context(|| format!("failed to load dependency {}", dep.pkg.name))?;
             rewrite::rewrite(&mut file, &dep.extern_map, Some(&dep.mangled));
+            macros::fix_macro_exports(&mut file).with_context(|| {
+                format!(
+                    "[macro] failed to localize macros in {} {}",
+                    dep.pkg.name, dep.pkg.version
+                )
+            })?;
+            macros::rewrite_macro_tokens(&mut file, &dep.extern_map, Some(&dep.mangled));
             Ok((dep.mangled.clone(), file))
         })
         .collect::<Result<Vec<_>>>()?;
