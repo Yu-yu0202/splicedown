@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use syn::Ident;
 
+use crate::preset::ExcludePreset;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     pub entry: Entry,
@@ -31,7 +33,12 @@ pub struct Dep {
 }
 
 impl Plan {
-    pub fn collect(manifest: &Path, entry: &Path, exclude: &[String]) -> Result<Plan> {
+    pub fn collect(
+        manifest: &Path,
+        entry: &Path,
+        exclude: &[String],
+        exclude_presets: &[ExcludePreset],
+    ) -> Result<Plan> {
         let metadata = MetadataCommand::new().manifest_path(manifest).exec()?;
         let resolve = metadata
             .resolve
@@ -47,7 +54,7 @@ impl Plan {
         let node_of: HashMap<&PackageId, &Node> =
             resolve.nodes.iter().map(|n| (&n.id, n)).collect();
 
-        let (mut bundled, skip_pkgs) = bfs_deps(root, &pkg_of, &node_of, exclude);
+        let (mut bundled, skip_pkgs) = bfs_deps(root, &pkg_of, &node_of, exclude, exclude_presets)?;
         bundled.sort_unstable_by(|a, b| {
             (&pkg_of[a].name, &pkg_of[a].version).cmp(&(&pkg_of[b].name, &pkg_of[b].version))
         });
@@ -100,7 +107,8 @@ fn bfs_deps(
     pkg_of: &HashMap<&PackageId, &Package>,
     node_of: &HashMap<&PackageId, &Node>,
     exclude: &[String],
-) -> (Vec<PackageId>, Vec<Package>) {
+    exclude_presets: &[ExcludePreset],
+) -> Result<(Vec<PackageId>, Vec<Package>)> {
     let mut visited: HashSet<PackageId> = HashSet::new();
     let mut queue: VecDeque<PackageId> = VecDeque::new();
 
@@ -127,7 +135,12 @@ fn bfs_deps(
                 continue;
             };
 
-            let is_skip = exclude.contains(&dep_pkg.name.to_string()) || is_proc_macro(dep_pkg);
+            // An explicit exclusion intentionally accepts every version and therefore
+            // overrides the stricter version check performed by presets.
+            let is_explicitly_excluded = exclude.iter().any(|name| name == dep_pkg.name.as_str());
+            let is_skip = is_explicitly_excluded
+                || preset_excludes(dep_pkg, exclude_presets)?
+                || is_proc_macro(dep_pkg);
 
             if visited.insert(dep_pkg.id.clone()) {
                 if is_skip {
@@ -140,7 +153,63 @@ fn bfs_deps(
         }
     }
 
-    (bundled, skip_pkgs)
+    Ok((bundled, skip_pkgs))
+}
+
+fn preset_excludes(pkg: &Package, presets: &[ExcludePreset]) -> Result<bool> {
+    let provided_by: Vec<_> = presets
+        .iter()
+        .flat_map(|preset| {
+            preset
+                .packages()
+                .iter()
+                .filter(|expected| expected.name == pkg.name.as_str())
+                .map(|expected| (*preset, expected.version))
+        })
+        .collect();
+
+    if provided_by.is_empty() {
+        return Ok(false);
+    }
+    if !is_crates_io_package(pkg) {
+        return Ok(false);
+    }
+    if provided_by
+        .iter()
+        .any(|(_, expected)| *expected == pkg.version.to_string())
+    {
+        return Ok(true);
+    }
+
+    let expectations = provided_by
+        .iter()
+        .map(|(preset, version)| format!("{} provides v{version}", preset.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let preset_flags = provided_by
+        .iter()
+        .map(|(preset, _)| format!("--exclude-preset {}", preset.name()))
+        .collect::<Vec<_>>()
+        .join(" / ");
+
+    anyhow::bail!(
+        "dependency {} resolved to v{}, but the selected exclude preset expects a different version ({expectations})\n\
+         hint: align the dependency version, remove {preset_flags}, or pass --exclude {} to explicitly keep it external",
+        pkg.name,
+        pkg.version,
+        pkg.name,
+    )
+}
+
+fn is_crates_io_package(pkg: &Package) -> bool {
+    pkg.source.as_ref().is_some_and(|source| {
+        matches!(
+            source.repr.as_str(),
+            "registry+https://github.com/rust-lang/crates.io-index"
+                | "registry+https://index.crates.io/"
+                | "sparse+https://index.crates.io/"
+        )
+    })
 }
 
 fn assert_all_2024(entry: &Package, deps: &[&Package]) -> Result<()> {
@@ -161,6 +230,9 @@ fn assert_all_2024(entry: &Package, deps: &[&Package]) -> Result<()> {
         for (name, version, edition) in bad {
             msg.push_str(&format!("  {} {}: {}\n", name, version, edition));
         }
+        msg.push_str(
+            "hint: use --exclude <crate> for judge-provided crates, or --exclude-preset atcoder-2025-10\n",
+        );
         anyhow::bail!(msg)
     } else {
         Ok(())
@@ -180,7 +252,7 @@ fn mangle(name: &str, version: &str, id_repr: &str) -> String {
         .collect()
 }
 
-fn is_proc_macro(pkg: &Package) -> bool {
+pub(crate) fn is_proc_macro(pkg: &Package) -> bool {
     pkg.targets
         .iter()
         .any(|t| t.kind.contains(&TargetKind::ProcMacro))
@@ -244,11 +316,18 @@ mod tests {
             &fixture("bin-2024/Cargo.toml"),
             &fixture("bin-2024/src/main.rs"),
             &exclude,
+            &[],
         )
     }
 
     fn pkg_names(pkgs: &[Package]) -> Vec<String> {
         pkgs.iter().map(|p| p.name.to_string()).collect()
+    }
+
+    fn mark_as_crates_io(pkg: &mut Package) {
+        pkg.source = Some(cargo_metadata::Source {
+            repr: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+        });
     }
 
     // =====================================================================
@@ -361,6 +440,7 @@ mod tests {
             &fixture("2018/main/Cargo.toml"),
             &fixture("2018/main/src/main.rs"),
             &[],
+            &[],
         )
         .unwrap_err();
 
@@ -375,6 +455,8 @@ mod tests {
         assert!(msg.contains("lib_old"), "message: {msg}");
         // edition が表示されていること(E2018 / 2018 のどちらの表記でも通る)
         assert!(msg.contains("2018"), "message: {msg}");
+        assert!(msg.contains("hint:"), "message: {msg}");
+        assert!(msg.contains("--exclude-preset atcoder-2025-10"));
     }
 
     // =====================================================================
@@ -428,5 +510,49 @@ mod tests {
             "lib-2024-a が skip_pkgs に重複記録されている: {skip:?}"
         );
         assert!(skip.contains(&PKG_PM.to_string()));
+    }
+
+    #[test]
+    fn matching_preset_package_is_excluded() {
+        let mut pkg = collect_main(&[]).unwrap().entry.pkg;
+        pkg.name = "proconio".parse().unwrap();
+        pkg.version = Version::parse("0.5.0").unwrap();
+        mark_as_crates_io(&mut pkg);
+
+        assert!(preset_excludes(&pkg, &[ExcludePreset::Atcoder2025October]).unwrap());
+    }
+
+    #[test]
+    fn preset_rejects_a_different_package_version_with_hint() {
+        let mut pkg = collect_main(&[]).unwrap().entry.pkg;
+        pkg.name = "proconio".parse().unwrap();
+        pkg.version = Version::parse("0.6.0").unwrap();
+        mark_as_crates_io(&mut pkg);
+
+        let error = preset_excludes(&pkg, &[ExcludePreset::Atcoder2025October]).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("proconio"), "message: {message}");
+        assert!(message.contains("v0.6.0"), "message: {message}");
+        assert!(message.contains("v0.5.0"), "message: {message}");
+        assert!(message.contains("atcoder-2025-10"), "message: {message}");
+        assert!(message.contains("hint:"), "message: {message}");
+        assert!(message.contains("--exclude proconio"), "message: {message}");
+    }
+
+    #[test]
+    fn preset_ignores_packages_not_in_its_snapshot() {
+        let pkg = collect_main(&[]).unwrap().entry.pkg;
+
+        assert!(!preset_excludes(&pkg, &[ExcludePreset::Atcoder2025October]).unwrap());
+    }
+
+    #[test]
+    fn preset_does_not_replace_a_local_fork_with_the_judge_crate() {
+        let mut pkg = collect_main(&[]).unwrap().entry.pkg;
+        pkg.name = "proconio".parse().unwrap();
+        pkg.version = Version::parse("0.5.0").unwrap();
+        pkg.source = None;
+
+        assert!(!preset_excludes(&pkg, &[ExcludePreset::Atcoder2025October]).unwrap());
     }
 }

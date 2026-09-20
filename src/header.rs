@@ -77,6 +77,7 @@ mod tests {
             &fixture("bin-2024/Cargo.toml"),
             &fixture("bin-2024/src/main.rs"),
             &[],
+            &[],
         )
         .unwrap();
 

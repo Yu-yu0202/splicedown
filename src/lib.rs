@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 pub async fn run() -> Result<()> {
     execute(cli::parse())
 }
@@ -24,8 +24,9 @@ fn execute(cli: cli::Cli) -> Result<()> {
     let entry = absolute_file(&cli.entry).context("[input] failed to resolve entry file")?;
     let manifest = resolve_manifest(&entry, cli.manifest_path.as_deref())
         .context("[input] failed to resolve Cargo.toml")?;
-    let plan = Plan::collect(&manifest, &entry, &cli.exclude)
+    let plan = Plan::collect(&manifest, &entry, &cli.exclude, &cli.exclude_preset)
         .context("[metadata] failed to collect the dependency graph")?;
+    warn_about_proc_macros(&plan);
 
     let mut source = bundle(&plan).context("[bundle] failed to build the bundled source")?;
 
@@ -54,6 +55,17 @@ fn execute(cli: cli::Cli) -> Result<()> {
     }
 
     emit_output(&source, cli.output.as_deref()).context("[output] failed to emit bundled source")
+}
+
+fn warn_about_proc_macros(plan: &Plan) {
+    for package in &plan.skip_pkgs {
+        if metadata::is_proc_macro(package) {
+            warn!(
+                "proc-macro dependency {} v{} remains external; it must be available in the judge environment",
+                package.name, package.version
+            );
+        }
+    }
 }
 
 fn bundled_deps_in_source(plan: &Plan, source: &str) -> Result<Vec<metadata::Dep>> {
@@ -324,6 +336,65 @@ mod tests {
         assert!(bundled.contains("crate::__splicedown_phase3_c"));
         assert!(bundled.contains("super::nested_value()"));
         assert!(bundled.contains("crate::utils::add(3, 4)"));
+    }
+
+    #[test]
+    fn macro_fixture_rewrites_tokens_and_passes_check() {
+        let output = TempOutput::new("macros");
+        let root = fixture("bin-2024");
+        let cli = cli::Cli {
+            entry: root.join("src/main.rs"),
+            manifest_path: Some(root.join("Cargo.toml")),
+            output: Some(output.path.clone()),
+            exclude: Vec::new(),
+            exclude_preset: Vec::new(),
+            minify: false,
+            no_minify: true,
+            minify_test: false,
+            no_minify_test: true,
+            no_check: false,
+            keep_check_dir: false,
+        };
+
+        execute(cli).unwrap();
+
+        let bundled = fs::read_to_string(&output.path).unwrap();
+        assert!(bundled.starts_with("// bundled by splicedown v"));
+        assert!(
+            bundled.contains("// - lib-2024-a (v0.0.0) (MIT) (https://example.com/lib-2024-a)")
+        );
+        assert!(!bundled.contains("#[macro_export]"));
+        assert!(bundled.contains("pub(crate) use a_report;"));
+        assert!(bundled.contains("__splicedown_lib_2024_a"));
+        assert!(bundled.contains("__splicedown_lib_2024_b"));
+        assert!(bundled.contains("use lib_pm::PmDummy;"));
+    }
+
+    #[test]
+    fn minify_removes_compiler_confirmed_dead_items() {
+        let output = TempOutput::new("minify");
+        let root = fixture("bin-2024");
+        let cli = cli::Cli {
+            entry: root.join("src/main.rs"),
+            manifest_path: Some(root.join("Cargo.toml")),
+            output: Some(output.path.clone()),
+            exclude: Vec::new(),
+            exclude_preset: Vec::new(),
+            minify: true,
+            no_minify: false,
+            minify_test: true,
+            no_minify_test: false,
+            no_check: false,
+            keep_check_dir: false,
+        };
+
+        execute(cli).unwrap();
+
+        let bundled = fs::read_to_string(&output.path).unwrap();
+        assert!(!bundled.contains("unused_phase5"));
+        assert!(bundled.contains("pub const C_CONST"));
+        assert!(bundled.contains("struct Dummy"));
+        assert!(bundled.starts_with("// bundled by splicedown v"));
     }
 
 }
