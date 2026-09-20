@@ -1,6 +1,7 @@
 mod assemble;
 mod check;
 mod cli;
+mod header;
 mod inline;
 mod macros;
 mod metadata;
@@ -12,29 +13,63 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
 pub async fn run() -> Result<()> {
     execute(cli::parse())
 }
 
 fn execute(cli: cli::Cli) -> Result<()> {
-    let entry = absolute_file(&cli.entry).context("failed to resolve entry file")?;
-    let manifest = resolve_manifest(&entry, cli.manifest_path.as_deref())?;
+    let entry = absolute_file(&cli.entry).context("[input] failed to resolve entry file")?;
+    let manifest = resolve_manifest(&entry, cli.manifest_path.as_deref())
+        .context("[input] failed to resolve Cargo.toml")?;
     let plan = Plan::collect(&manifest, &entry, &cli.exclude)
-        .context("failed to collect the dependency graph")?;
-    let source = bundle(&plan)?;
+        .context("[metadata] failed to collect the dependency graph")?;
+
+    let mut source = bundle(&plan).context("[bundle] failed to build the bundled source")?;
+
+    let bundled_deps = bundled_deps_in_source(&plan, &source)?;
+    source = prepend_header(&source, &header::render(&bundled_deps));
 
     if !cli.no_check {
         check::run(&source, &plan.skip_pkgs, cli.keep_check_dir)
-            .context("bundled source failed cargo check")?;
+            .context("[check] generated source validation failed")?;
     }
 
-    emit_output(&source, cli.output.as_deref())
+    emit_output(&source, cli.output.as_deref()).context("[output] failed to emit bundled source")
+}
+
+fn bundled_deps_in_source(plan: &Plan, source: &str) -> Result<Vec<metadata::Dep>> {
+    let file = syn::parse_file(source).context("failed to inspect the assembled bundle")?;
+    let module_names = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) => Some(module.ident.to_string()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    Ok(plan
+        .deps
+        .iter()
+        .filter(|dep| module_names.contains(&dep.mangled.to_string()))
+        .cloned()
+        .collect())
+}
+
+fn prepend_header(source: &str, header: &str) -> String {
+    if source.starts_with("#!")
+        && !source.starts_with("#![")
+        && let Some(newline) = source.find('\n')
+    {
+        let (shebang, rest) = source.split_at(newline + 1);
+        return format!("{shebang}{header}{rest}");
+    }
+    format!("{header}{source}")
 }
 
 fn bundle(plan: &Plan) -> Result<String> {
     let mut main = inline::load_and_inline(plan.entry.src.as_std_path())
-        .with_context(|| format!("failed to load entry {}", plan.entry.src))?;
+        .with_context(|| format!("[inline] failed to load entry {}", plan.entry.src))?;
     rewrite::rewrite(&mut main, &plan.entry.extern_map, None);
     macros::rewrite_macro_tokens(&mut main, &plan.entry.extern_map, None);
 
@@ -42,8 +77,13 @@ fn bundle(plan: &Plan) -> Result<String> {
         .deps
         .iter()
         .map(|dep| {
-            let mut file = inline::load_and_inline(dep.lib_src.as_std_path())
-                .with_context(|| format!("failed to load dependency {}", dep.pkg.name))?;
+            let mut file =
+                inline::load_and_inline(dep.lib_src.as_std_path()).with_context(|| {
+                    format!(
+                        "[inline] failed to load dependency {} {} from {}",
+                        dep.pkg.name, dep.pkg.version, dep.lib_src
+                    )
+                })?;
             rewrite::rewrite(&mut file, &dep.extern_map, Some(&dep.mangled));
             macros::fix_macro_exports(&mut file).with_context(|| {
                 format!(
@@ -196,6 +236,14 @@ mod tests {
     }
 
     #[test]
+    fn provenance_header_follows_a_shebang() {
+        let source = "#!/usr/bin/env rust-script\nfn main() {}\n";
+        let output = prepend_header(source, "// generated\n\n");
+
+        assert!(output.starts_with("#!/usr/bin/env rust-script\n// generated\n\n"));
+    }
+
+    #[test]
     fn local_module_bundle_passes_check_and_is_written() {
         let project = TestProject::new(
             "mod utils;\nuse utils::mul;\nfn main() { let _ = utils::add(1, 2); let _ = crate::utils::add(3, 4); let _ = mul(5, 6); }\n",
@@ -221,7 +269,7 @@ mod tests {
 
         let error = execute(project.cli(output.clone())).unwrap_err();
 
-        assert!(error.to_string().contains("cargo check"));
+        assert!(format!("{error:#}").contains("cargo check"));
         assert!(!output.exists());
     }
 
@@ -248,4 +296,5 @@ mod tests {
         assert!(bundled.contains("super::nested_value()"));
         assert!(bundled.contains("crate::utils::add(3, 4)"));
     }
+
 }
