@@ -34,23 +34,40 @@ fn execute(cli: cli::Cli) -> Result<()> {
         dead_code: cli.minify_enabled(),
         test_code: cli.minify_test_enabled(),
     };
+    let mut check_packages = check::referenced_packages(&source, &plan.skip_pkgs)?;
+    let mut validated = false;
     if minify.dead_code || minify.test_code {
-        let manifest = check::manifest_toml(&plan.skip_pkgs)
+        let manifest = check::manifest_toml(&check_packages)
             .context("[minify] failed to prepare the validation manifest")?;
         let result = minify::run(&source, &manifest, minify)
+            .or_else(|error| {
+                if check_packages.len() == plan.skip_pkgs.len() {
+                    return Err(error);
+                }
+                // Macro expansion can synthesize references absent from source tokens.
+                check_packages = plan.skip_pkgs.clone();
+                minify::run(&source, &check::manifest_toml(&check_packages)?, minify)
+            })
             .context("[minify] failed to remove unused bundled items")?;
         info!(
             "minified bundle: removed {} items in {} compiler passes",
             result.removed_items, result.passes
         );
         source = result.source;
+        validated = true;
     }
 
     let bundled_deps = bundled_deps_in_source(&plan, &source)?;
     source = prepend_header(&source, &header::render(&bundled_deps));
 
-    if !cli.no_check {
-        check::run(&source, &plan.skip_pkgs, cli.keep_check_dir)
+    if !cli.no_check && (!validated || cli.keep_check_dir) {
+        check::run(&source, &check_packages, cli.keep_check_dir)
+            .or_else(|error| {
+                if check_packages.len() == plan.skip_pkgs.len() {
+                    return Err(error);
+                }
+                check::run(&source, &plan.skip_pkgs, cli.keep_check_dir)
+            })
             .context("[check] generated source validation failed")?;
     }
 

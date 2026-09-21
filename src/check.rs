@@ -9,6 +9,56 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static CHECK_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Conservatively retain every dependency name occurring anywhere in tokens,
+/// including macro bodies and attributes. Proc macros may emit hidden paths,
+/// so their presence disables this optimization.
+pub(crate) fn referenced_packages(source: &str, packages: &[Package]) -> Result<Vec<Package>> {
+    fn identifiers(
+        tokens: proc_macro2::TokenStream,
+        names: &mut std::collections::HashSet<String>,
+    ) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Ident(name) => {
+                    names.insert(name.to_string().trim_start_matches("r#").to_owned());
+                }
+                proc_macro2::TokenTree::Group(group) => identifiers(group.stream(), names),
+                _ => {}
+            }
+        }
+    }
+    let file = syn::parse_file(source)?;
+    // Parsing the file first removes a possible shebang.
+    let tokens = prettyplease::unparse(&syn::File {
+        shebang: None,
+        ..file
+    })
+    .parse::<proc_macro2::TokenStream>()
+    .map_err(|error| anyhow::anyhow!("failed to scan dependency references: {error}"))?;
+    let mut names = std::collections::HashSet::new();
+    identifiers(tokens, &mut names);
+    let referenced = |package: &&Package| {
+        names.contains(&package.name.to_string().replace('-', "_"))
+            || package.targets.iter().any(|target| {
+                target.kind.iter().any(|kind| {
+                    matches!(
+                        kind,
+                        cargo_metadata::TargetKind::Lib | cargo_metadata::TargetKind::ProcMacro
+                    )
+                }) && names.contains(&target.name.replace('-', "_"))
+            })
+    };
+    let selected = packages
+        .iter()
+        .filter(referenced)
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.iter().any(crate::metadata::is_proc_macro) {
+        return Ok(packages.to_vec());
+    }
+    Ok(selected)
+}
+
 /// Check a generated bundle in an isolated temporary Cargo package.
 ///
 /// The temporary package is removed when this function returns unless
@@ -281,6 +331,31 @@ mod tests {
     use super::*;
     use cargo_metadata::MetadataCommand;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn dependency_scan_includes_nested_tokens_but_not_comments() {
+        let a = fixture_package("lib-2024-a");
+        let mut b = fixture_package("lib-2024-b");
+        let mut test_target = b.targets[0].clone();
+        test_target.name = "test".to_owned();
+        test_target.kind = vec![cargo_metadata::TargetKind::Test];
+        b.targets.push(test_target);
+        let packages = vec![a.clone(), b];
+        let selected = referenced_packages(
+            "#!/usr/bin/env rust-script\n// lib_2024_b\nmacro_rules! m { () => { lib_2024_a::f() }; } #[test] fn smoke() {} fn main() {}",
+            &packages,
+        ).unwrap();
+        assert_eq!(selected, vec![a]);
+    }
+
+    #[test]
+    fn referenced_proc_macro_keeps_hidden_dependencies_available() {
+        let packages = vec![fixture_package("lib-pm"), fixture_package("lib-2024-a")];
+        assert_eq!(
+            referenced_packages("use lib_pm::PmDummy; fn main() {}", &packages).unwrap(),
+            packages
+        );
+    }
 
     fn fixture_manifest() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin-2024/Cargo.toml")

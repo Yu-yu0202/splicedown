@@ -43,12 +43,12 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
     let mut passes = 0;
 
     work.write_source(&last_good)?;
-    let initial = work.check()?;
+    let mut check = work.check()?;
     passes += 1;
-    if !initial.success {
+    if !check.success {
         bail!(
             "cannot minify a bundle that does not pass cargo check\n{}",
-            initial.errors
+            check.errors
         );
     }
 
@@ -63,7 +63,7 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
         let validation = work.check()?;
         passes += 1;
         if !validation.success {
-            return Ok(Minified {
+            return work.finish(Minified {
                 source: last_good,
                 removed_items,
                 passes,
@@ -71,10 +71,11 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
         }
         removed_items += test_items;
         last_good = speculative;
+        check = validation;
     }
 
     if !options.dead_code {
-        return Ok(Minified {
+        return work.finish(Minified {
             source: last_good,
             removed_items,
             passes,
@@ -82,26 +83,16 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
     }
 
     loop {
-        work.write_source(&last_good)?;
-        let check = work.check()?;
-        passes += 1;
-
-        if !check.success {
-            return Ok(Minified {
-                source: last_good,
-                removed_items,
-                passes,
-            });
-        }
-
-        let mut candidates = check.dead_items.into_iter().collect::<Vec<_>>();
+        let mut candidates = removable_candidates(&file, &check.dead_items)
+            .into_iter()
+            .collect::<Vec<_>>();
         candidates.sort();
         let mut removed_this_pass = 0;
-
-        for candidate in candidates {
+        let mut batches = vec![candidates];
+        while let Some(batch) = batches.pop() {
             let mut speculative_file = file.clone();
             let removed =
-                remove_unique_candidates(&mut speculative_file, &HashSet::from([candidate]));
+                remove_unique_candidates(&mut speculative_file, &batch.iter().cloned().collect());
             if removed == 0 {
                 continue;
             }
@@ -111,6 +102,11 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
             let validation = work.check()?;
             passes += 1;
             if !validation.success {
+                if batch.len() > 1 {
+                    let middle = batch.len() / 2;
+                    batches.push(batch[middle..].to_vec());
+                    batches.push(batch[..middle].to_vec());
+                }
                 continue;
             }
 
@@ -118,10 +114,11 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
             last_good = speculative;
             removed_items += removed;
             removed_this_pass += removed;
+            check = validation;
         }
 
         if removed_this_pass == 0 {
-            return Ok(Minified {
+            return work.finish(Minified {
                 source: last_good,
                 removed_items,
                 passes,
@@ -246,11 +243,16 @@ fn candidate_from_diagnostic(diagnostic: &Diagnostic) -> Option<Candidate> {
 /// AST item in the whole bundle. This deliberately gives up some size savings
 /// for duplicate names rather than risking removal from the wrong module.
 fn remove_unique_candidates(file: &mut File, candidates: &HashSet<Candidate>) -> usize {
+    let removable = removable_candidates(file, candidates);
+    remove_items(&mut file.items, &removable)
+}
+
+fn removable_candidates(file: &File, candidates: &HashSet<Candidate>) -> HashSet<Candidate> {
     let mut counts = HashMap::<Candidate, usize>::new();
     count_items(&file.items, &mut counts);
     let mut impl_types = HashSet::new();
     collect_impl_types(&file.items, &mut impl_types);
-    let unique = candidates
+    candidates
         .iter()
         .filter(|candidate| counts.get(*candidate) == Some(&1))
         .filter(|candidate| {
@@ -259,10 +261,16 @@ fn remove_unique_candidates(file: &mut File, candidates: &HashSet<Candidate>) ->
                 ItemKind::Struct | ItemKind::Enum | ItemKind::TypeAlias
             ) || !impl_types.contains(&candidate.name)
         })
+        .filter(|candidate| item_is_removable(&file.items, candidate))
         .cloned()
-        .collect::<HashSet<_>>();
+        .collect()
+}
 
-    remove_items(&mut file.items, &unique)
+fn item_is_removable(items: &[Item], candidate: &Candidate) -> bool {
+    items.iter().any(|item| {
+        item_candidate(item).as_ref() == Some(candidate) && item_is_safe_to_remove(item)
+            || matches!(item, Item::Mod(module) if module.content.as_ref().is_some_and(|(_, nested)| item_is_removable(nested, candidate)))
+    })
 }
 
 fn collect_impl_types(items: &[Item], names: &mut HashSet<String>) {
@@ -430,6 +438,29 @@ struct WorkDir {
 }
 
 impl WorkDir {
+    fn finish(&self, mut result: Minified) -> Result<Minified> {
+        // Restore last-good source after a rejected batch, and validate with
+        // ordinary lint settings: --force-warn would override deny(dead_code).
+        self.write_source(&result.source)?;
+        let output = Command::new("cargo")
+            .args(["check", "--quiet"])
+            .arg("--manifest-path")
+            .arg(self.path.join("Cargo.toml"))
+            .current_dir(&self.path)
+            .output()
+            .context("failed to execute final minify validation")?;
+        result.passes += 1;
+        if !output.status.success() {
+            bail!(
+                "cargo check failed after minification\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(result)
+    }
     fn create() -> Result<Self> {
         let base = std::env::temp_dir();
         let timestamp = SystemTime::now()
@@ -693,6 +724,49 @@ mod tests {
         assert!(!result.source.contains("mod tests"));
         assert!(result.source.contains("fn live"));
         assert!(result.source.contains("fn main"));
+    }
+
+    #[test]
+    fn batches_independent_candidates_without_rechecking_the_same_source() {
+        let mut source = String::from("#![allow(dead_code)]\nfn main() {}\n");
+        for n in 0..20 {
+            source.push_str(&format!("fn unused_{n}() {{}}\n"));
+        }
+        let result = run(&source,
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: true, test_code: false }).unwrap();
+        assert_eq!(result.removed_items, 20);
+        // Initial diagnostics, one batch, final ordinary-lint validation.
+        assert_eq!(result.passes, 3);
+    }
+
+    #[test]
+    fn does_not_check_candidates_that_cannot_be_removed_from_the_ast() {
+        let mut source = String::from("#![allow(dead_code)]\n");
+        for n in 0..20 {
+            source.push_str(&format!(
+                "mod m{n} {{ pub fn live() {{}} fn duplicate() {{}} }}\n"
+            ));
+        }
+        source.push_str("fn main() {");
+        for n in 0..20 {
+            source.push_str(&format!("m{n}::live();"));
+        }
+        source.push_str("}\n");
+        source.push_str("fn removable() {}\n");
+        let result = run(&source,
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: true, test_code: false }).unwrap();
+        assert_eq!(result.removed_items, 1);
+        assert_eq!(result.passes, 3);
+    }
+
+    #[test]
+    fn final_validation_respects_denied_dead_code() {
+        let error = run("#![deny(dead_code)]\nfn unused() {}\nfn main() {}",
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: false, test_code: true }).unwrap_err();
+        assert!(error.to_string().contains("cargo check failed"));
     }
 
     #[test]
