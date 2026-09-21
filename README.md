@@ -22,7 +22,7 @@
 ## Installation
 
 ```bash
-cargo binstall --locked splicedown # 通常の cargo install でも可
+cargo binstall --locked splicedown-rs # 通常の cargo install でも可
 # or
 cargo binstall --locked --git https://github.com/Yu-yu0202/splicedown.git
 ```
