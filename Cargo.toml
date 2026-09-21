@@ -1,6 +1,6 @@
 [package]
 name = "splicedown-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, modern bundler written in Rust."
 license = "MIT OR Apache-2.0"
