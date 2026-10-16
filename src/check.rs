@@ -13,30 +13,8 @@ static CHECK_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// including macro bodies and attributes. Proc macros may emit hidden paths,
 /// so their presence disables this optimization.
 pub(crate) fn referenced_packages(source: &str, packages: &[Package]) -> Result<Vec<Package>> {
-    fn identifiers(
-        tokens: proc_macro2::TokenStream,
-        names: &mut std::collections::HashSet<String>,
-    ) {
-        for token in tokens {
-            match token {
-                proc_macro2::TokenTree::Ident(name) => {
-                    names.insert(name.to_string().trim_start_matches("r#").to_owned());
-                }
-                proc_macro2::TokenTree::Group(group) => identifiers(group.stream(), names),
-                _ => {}
-            }
-        }
-    }
     let file = syn::parse_file(source)?;
-    // Parsing the file first removes a possible shebang.
-    let tokens = prettyplease::unparse(&syn::File {
-        shebang: None,
-        ..file
-    })
-    .parse::<proc_macro2::TokenStream>()
-    .map_err(|error| anyhow::anyhow!("failed to scan dependency references: {error}"))?;
-    let mut names = std::collections::HashSet::new();
-    identifiers(tokens, &mut names);
+    let names = referenced_identifiers(&file)?;
     let referenced = |package: &&Package| {
         names.contains(&package.name.to_string().replace('-', "_"))
             || package.targets.iter().any(|target| {
@@ -59,6 +37,37 @@ pub(crate) fn referenced_packages(source: &str, packages: &[Package]) -> Result<
     Ok(selected)
 }
 
+/// Collect identifiers from Rust tokens, including identifiers inside macro
+/// bodies, attributes, and groups. Clearing a parsed shebang preserves the
+/// same behavior as scanning a source string after `syn::parse_file`.
+pub(crate) fn referenced_identifiers(
+    file: &syn::File,
+) -> Result<std::collections::HashSet<String>> {
+    fn identifiers(
+        tokens: proc_macro2::TokenStream,
+        names: &mut std::collections::HashSet<String>,
+    ) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Ident(name) => {
+                    names.insert(name.to_string().trim_start_matches("r#").to_owned());
+                }
+                proc_macro2::TokenTree::Group(group) => identifiers(group.stream(), names),
+                _ => {}
+            }
+        }
+    }
+    let tokens = prettyplease::unparse(&syn::File {
+        shebang: None,
+        ..file.clone()
+    })
+    .parse::<proc_macro2::TokenStream>()
+    .map_err(|error| anyhow::anyhow!("failed to scan dependency references: {error}"))?;
+    let mut names = std::collections::HashSet::new();
+    identifiers(tokens, &mut names);
+    Ok(names)
+}
+
 /// Check a generated bundle in an isolated temporary Cargo package.
 ///
 /// The temporary package is removed when this function returns unless
@@ -77,7 +86,12 @@ pub(crate) fn run(source: &str, skip_pkgs: &[Package], keep_dir: bool) -> Result
     fs::create_dir(&src_dir).with_context(|| format!("failed to create {}", src_dir.display()))?;
 
     let manifest_path = check_dir.path().join("Cargo.toml");
-    fs::write(&manifest_path, manifest)
+    let target_name = check_dir
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("check directory name is not valid UTF-8")?;
+    fs::write(&manifest_path, manifest_for_target(&manifest, target_name))
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 
     let source_path = src_dir.join("main.rs");
@@ -87,6 +101,8 @@ pub(crate) fn run(source: &str, skip_pkgs: &[Package], keep_dir: bool) -> Result
     let output = Command::new("cargo")
         .arg("check")
         .arg("--quiet")
+        .arg("--bin")
+        .arg(target_name)
         .arg("--manifest-path")
         .arg(&manifest_path)
         .current_dir(check_dir.path())
@@ -152,6 +168,19 @@ pub(crate) fn manifest_toml(skip_pkgs: &[Package]) -> Result<String> {
     }
 
     Ok(manifest)
+}
+
+/// Add a uniquely named binary target for an isolated check crate.
+///
+/// Cargo can otherwise treat two temporary crates with the same package and
+/// target names as the same cached unit even when their source directories
+/// differ. A per-directory target name keeps the package identity stable for
+/// dependency reuse while distinguishing the generated binary.
+pub(crate) fn manifest_for_target(manifest: &str, target_name: &str) -> String {
+    format!(
+        "{manifest}\n[[bin]]\nname = {}\npath = \"src/main.rs\"\n",
+        toml_string(target_name)
+    )
 }
 
 /// Render the right-hand side of one entry in [dependencies].
@@ -384,6 +413,14 @@ mod tests {
         assert!(manifest.contains("[dependencies]"));
         assert!(manifest.contains("lib-pm = { path = \""));
         assert!(manifest.contains("/tests/fixtures/lib-pm\" }"));
+    }
+
+    #[test]
+    fn manifest_can_select_a_unique_binary_target() {
+        let manifest = manifest_for_target(&manifest_toml(&[]).unwrap(), "splicedown-check-42");
+
+        assert!(manifest.contains("[[bin]]\nname = \"splicedown-check-42\""));
+        assert!(manifest.contains("path = \"src/main.rs\""));
     }
 
     #[test]

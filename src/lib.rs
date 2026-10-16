@@ -28,7 +28,8 @@ fn execute(cli: cli::Cli) -> Result<()> {
         .context("[metadata] failed to collect the dependency graph")?;
     warn_about_proc_macros(&plan);
 
-    let mut source = bundle(&plan).context("[bundle] failed to build the bundled source")?;
+    let (mut source, omitted_deps) = bundle(&plan, cli.minify_enabled())
+        .context("[bundle] failed to build the bundled source")?;
 
     let minify = minify::Options {
         dead_code: cli.minify_enabled(),
@@ -41,10 +42,19 @@ fn execute(cli: cli::Cli) -> Result<()> {
             .context("[minify] failed to prepare the validation manifest")?;
         let result = minify::run(&source, &manifest, minify)
             .or_else(|error| {
+                if omitted_deps {
+                    // Proc macros can synthesize references that are absent from
+                    // the source tokens used to select bundled dependencies.
+                    let (full_source, _) = bundle(&plan, false)?;
+                    source = full_source;
+                    check_packages = plan.skip_pkgs.clone();
+                    return minify::run(&source, &check::manifest_toml(&check_packages)?, minify);
+                }
                 if check_packages.len() == plan.skip_pkgs.len() {
                     return Err(error);
                 }
-                // Macro expansion can synthesize references absent from source tokens.
+                // Macro expansion can synthesize references to external crates
+                // that are absent from source tokens.
                 check_packages = plan.skip_pkgs.clone();
                 minify::run(&source, &check::manifest_toml(&check_packages)?, minify)
             })
@@ -115,36 +125,66 @@ fn prepend_header(source: &str, header: &str) -> String {
     format!("{header}{source}")
 }
 
-fn bundle(plan: &Plan) -> Result<String> {
+fn bundle(plan: &Plan, prune_deps: bool) -> Result<(String, bool)> {
     let mut main = inline::load_and_inline(plan.entry.src.as_std_path())
         .with_context(|| format!("[inline] failed to load entry {}", plan.entry.src))?;
     rewrite::rewrite(&mut main, &plan.entry.extern_map, None);
     macros::rewrite_macro_tokens(&mut main, &plan.entry.extern_map, None);
 
+    let mut loaded = std::collections::HashMap::<String, syn::File>::new();
+    if prune_deps {
+        let mut reachable = check::referenced_identifiers(&main)
+            .context("failed to scan bundled dependency references in the entry")?;
+        while let Some(dep) = plan.deps.iter().find(|dep| {
+            let name = dep.mangled.to_string();
+            !loaded.contains_key(&name) && reachable.contains(&name)
+        }) {
+            let file = load_dependency(dep)?;
+            reachable.extend(
+                check::referenced_identifiers(&file)
+                    .with_context(|| format!("failed to scan dependency {}", dep.pkg.name))?,
+            );
+            loaded.insert(dep.mangled.to_string(), file);
+        }
+    } else {
+        for dep in &plan.deps {
+            loaded.insert(dep.mangled.to_string(), load_dependency(dep)?);
+        }
+    }
+
+    let omitted_deps = loaded.len() != plan.deps.len();
     let deps = plan
         .deps
         .iter()
-        .map(|dep| {
-            let mut file =
-                inline::load_and_inline(dep.lib_src.as_std_path()).with_context(|| {
-                    format!(
-                        "[inline] failed to load dependency {} {} from {}",
-                        dep.pkg.name, dep.pkg.version, dep.lib_src
-                    )
-                })?;
-            rewrite::rewrite(&mut file, &dep.extern_map, Some(&dep.mangled));
-            macros::fix_macro_exports(&mut file).with_context(|| {
-                format!(
-                    "[macro] failed to localize macros in {} {}",
-                    dep.pkg.name, dep.pkg.version
-                )
-            })?;
-            macros::rewrite_macro_tokens(&mut file, &dep.extern_map, Some(&dep.mangled));
-            Ok((dep.mangled.clone(), file))
+        .filter_map(|dep| {
+            loaded
+                .remove(&dep.mangled.to_string())
+                .map(|file| (dep.mangled.clone(), file))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
 
-    Ok(prettyplease::unparse(&assemble::assemble(main, deps)))
+    Ok((
+        prettyplease::unparse(&assemble::assemble(main, deps)),
+        omitted_deps,
+    ))
+}
+
+fn load_dependency(dep: &metadata::Dep) -> Result<syn::File> {
+    let mut file = inline::load_and_inline(dep.lib_src.as_std_path()).with_context(|| {
+        format!(
+            "[inline] failed to load dependency {} {} from {}",
+            dep.pkg.name, dep.pkg.version, dep.lib_src
+        )
+    })?;
+    rewrite::rewrite(&mut file, &dep.extern_map, Some(&dep.mangled));
+    macros::fix_macro_exports(&mut file).with_context(|| {
+        format!(
+            "[macro] failed to localize macros in {} {}",
+            dep.pkg.name, dep.pkg.version
+        )
+    })?;
+    macros::rewrite_macro_tokens(&mut file, &dep.extern_map, Some(&dep.mangled));
+    Ok(file)
 }
 
 fn resolve_manifest(entry: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
@@ -210,6 +250,10 @@ mod tests {
         root: PathBuf,
     }
 
+    struct TestWorkspace {
+        root: PathBuf,
+    }
+
     struct TempOutput {
         path: PathBuf,
     }
@@ -267,7 +311,58 @@ mod tests {
         }
     }
 
+    impl TestWorkspace {
+        fn new(members: &[&str]) -> Self {
+            let id = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("splicedown-deps-test-{}-{id}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let members = members
+                .iter()
+                .map(|member| format!("\"{member}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[workspace]\nmembers = [{members}]\nresolver = \"3\"\n"),
+            )
+            .unwrap();
+            Self { root }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, contents).unwrap();
+            path
+        }
+
+        fn cli(&self, output: PathBuf, minify: bool) -> cli::Cli {
+            cli::Cli {
+                entry: self.root.join("app/src/main.rs"),
+                manifest_path: Some(self.root.join("app/Cargo.toml")),
+                output: Some(output),
+                exclude: Vec::new(),
+                exclude_preset: Vec::new(),
+                minify,
+                no_minify: !minify,
+                minify_test: false,
+                no_minify_test: !minify,
+                no_check: true,
+                keep_check_dir: false,
+            }
+        }
+    }
+
     impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Drop for TestWorkspace {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -412,5 +507,136 @@ mod tests {
         assert!(bundled.contains("pub const C_CONST"));
         assert!(bundled.contains("struct Dummy"));
         assert!(bundled.starts_with("// bundled by splicedown v"));
+    }
+
+    #[test]
+    fn minification_skips_unused_dependency_source_before_loading_it() {
+        let workspace = TestWorkspace::new(&["app", "used", "unused-heavy"]);
+        workspace.write(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nused = { path = \"../used\" }\nunused-heavy = { path = \"../unused-heavy\" }\n",
+        );
+        workspace.write("app/src/main.rs", "fn main() { let _ = used::value(); }\n");
+        workspace.write(
+            "used/Cargo.toml",
+            "[package]\nname = \"used\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        workspace.write("used/src/lib.rs", "pub fn value() -> usize { 7 }\n");
+        workspace.write(
+            "unused-heavy/Cargo.toml",
+            "[package]\nname = \"unused-heavy\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        let mut heavy_source = String::from("#[path = \"unsupported.rs\"] mod unsupported;\n");
+        for index in 0..1_000 {
+            heavy_source.push_str(&format!("pub fn heavy_{index}() -> usize {{ {index} }}\n"));
+        }
+        workspace.write("unused-heavy/src/lib.rs", &heavy_source);
+
+        let output = workspace.root.join("out.rs");
+        execute(workspace.cli(output.clone(), true)).unwrap();
+
+        let bundled = fs::read_to_string(output).unwrap();
+        assert!(!bundled.contains("unused-heavy"));
+        assert!(!bundled.contains("unsupported.rs"));
+        assert!(!bundled.contains("heavy_999"));
+
+        let error =
+            execute(workspace.cli(workspace.root.join("unminified.rs"), false)).unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported #[path] attribute"));
+    }
+
+    #[test]
+    fn dependency_reachability_scans_renamed_paths_in_local_modules_and_macros() {
+        let workspace = TestWorkspace::new(&["app", "root-dep", "transitive", "unused-heavy"]);
+        workspace.write(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ntop_alias = { package = \"root-dep\", path = \"../root-dep\" }\nunused-heavy = { path = \"../unused-heavy\" }\n",
+        );
+        workspace.write(
+            "app/src/main.rs",
+            "mod local;\nfn main() { let _ = local::call(); }\n",
+        );
+        workspace.write(
+            "app/src/local.rs",
+            "pub fn call() -> usize { top_alias::use_transitive!() }\n",
+        );
+        workspace.write(
+            "root-dep/Cargo.toml",
+            "[package]\nname = \"root-dep\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ntransitive = { path = \"../transitive\" }\n",
+        );
+        workspace.write(
+            "root-dep/src/lib.rs",
+            "#[macro_export]\nmacro_rules! use_transitive { () => { transitive::value() }; }\n",
+        );
+        workspace.write(
+            "transitive/Cargo.toml",
+            "[package]\nname = \"transitive\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        workspace.write("transitive/src/lib.rs", "pub fn value() -> usize { 42 }\n");
+        workspace.write(
+            "unused-heavy/Cargo.toml",
+            "[package]\nname = \"unused-heavy\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        workspace.write(
+            "unused-heavy/src/lib.rs",
+            "pub fn unused() -> usize { 999 }\n",
+        );
+
+        let output = workspace.root.join("out.rs");
+        execute(workspace.cli(output.clone(), true)).unwrap();
+
+        let bundled = fs::read_to_string(output).unwrap();
+        assert!(bundled.contains("root-dep"));
+        assert!(bundled.contains("transitive"));
+        assert!(!bundled.contains("unused-heavy"));
+        assert!(bundled.contains("__splicedown_root_dep_"));
+        assert!(bundled.contains("__splicedown_transitive_"));
+    }
+
+    #[test]
+    fn minification_retries_with_full_bundle_for_proc_macro_generated_dependency_paths() {
+        let workspace = TestWorkspace::new(&["app", "hidden-dep", "source-macro"]);
+        workspace.write(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nhidden-dep = { path = \"../hidden-dep\" }\nsource-macro = { path = \"../source-macro\" }\n",
+        );
+        let entry = workspace.write(
+            "app/src/main.rs",
+            "#[source_macro::emit_hidden]\nstruct Marker;\nfn main() {}\n",
+        );
+        workspace.write(
+            "hidden-dep/Cargo.toml",
+            "[package]\nname = \"hidden-dep\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        workspace.write("hidden-dep/src/lib.rs", "pub fn hidden_value() {}\n");
+        workspace.write(
+            "source-macro/Cargo.toml",
+            "[package]\nname = \"source-macro\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
+        );
+        workspace.write(
+            "source-macro/src/lib.rs",
+            "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_attribute]\npub fn emit_hidden(_: TokenStream, item: TokenStream) -> TokenStream { item }\n",
+        );
+
+        let plan = Plan::collect(&workspace.root.join("app/Cargo.toml"), &entry, &[], &[]).unwrap();
+        let hidden_module = plan
+            .deps
+            .iter()
+            .find(|dep| dep.pkg.name == "hidden-dep")
+            .unwrap()
+            .mangled
+            .to_string();
+        let macro_source = format!(
+            "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_attribute]\npub fn emit_hidden(_: TokenStream, item: TokenStream) -> TokenStream {{\n    let mut output = item;\n    output.extend({:?}.parse::<TokenStream>().unwrap());\n    output\n}}\n",
+            format!("const _: fn() = crate::{hidden_module}::hidden_value;")
+        );
+        workspace.write("source-macro/src/lib.rs", &macro_source);
+
+        let output = workspace.root.join("out.rs");
+        execute(workspace.cli(output.clone(), true)).unwrap();
+
+        let bundled = fs::read_to_string(output).unwrap();
+        assert!(bundled.contains("hidden-dep"));
+        assert!(bundled.contains("source_macro::emit_hidden"));
     }
 }

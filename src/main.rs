@@ -6,6 +6,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .without_time()
         .with_target(false)
+        .with_writer(std::io::stderr)
         .compact()
         .init();
 

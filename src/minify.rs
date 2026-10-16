@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use cargo_metadata::Message;
 use cargo_metadata::diagnostic::{Diagnostic, DiagnosticLevel};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
@@ -83,7 +83,14 @@ pub(crate) fn run(source: &str, manifest: &str, options: Options) -> Result<Mini
     }
 
     loop {
-        let mut candidates = removable_candidates(&file, &check.dead_items)
+        // Diagnostic locations refer to the emitted source, not the AST that
+        // prettyplease was given. Reparse only between rounds so pending
+        // batches continue to refer to the same AST locations.
+        file = syn::parse_file(&last_good).context("failed to parse checked bundle")?;
+        // syn removes the shebang text before assigning spans, while rustc
+        // reports byte offsets in the complete emitted file (newline included).
+        let span_offset = file.shebang.as_deref().map_or(0, str::len);
+        let mut candidates = removable_candidates(&file, &check.dead_items, span_offset)
             .into_iter()
             .collect::<Vec<_>>();
         candidates.sort();
@@ -201,68 +208,73 @@ enum ItemKind {
     Enum,
     TypeAlias,
     Module,
+    Method,
+    AssociatedConstant,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Candidate {
     kind: ItemKind,
     name: String,
+    byte_range: (usize, usize),
 }
 
-fn candidate_from_diagnostic(diagnostic: &Diagnostic) -> Option<Candidate> {
-    if diagnostic.level != DiagnosticLevel::Warning || diagnostic.code.as_ref()?.code != "dead_code"
+// Only primary spans in the checked source can identify removable AST nodes.
+// In particular, spans in a macro expansion must not identify its invocation.
+fn dead_spans(diagnostic: &Diagnostic, source_path: &std::path::Path) -> HashSet<(usize, usize)> {
+    if diagnostic.level != DiagnosticLevel::Warning
+        || diagnostic
+            .code
+            .as_ref()
+            .is_none_or(|code| code.code != "dead_code")
     {
-        return None;
+        return HashSet::new();
     }
-
-    let (prefix, kind) = [
-        ("function `", ItemKind::Function),
-        ("constant `", ItemKind::Constant),
-        ("static `", ItemKind::Static),
-        ("struct `", ItemKind::Struct),
-        ("enum `", ItemKind::Enum),
-        ("type alias `", ItemKind::TypeAlias),
-        ("module `", ItemKind::Module),
-    ]
-    .into_iter()
-    .find(|(prefix, _)| diagnostic.message.starts_with(prefix))?;
-
-    let rest = diagnostic.message.strip_prefix(prefix)?;
-    let name = rest.split('`').next()?;
-    if name.is_empty() {
-        return None;
-    }
-
-    Some(Candidate {
-        kind,
-        name: name.to_owned(),
-    })
+    diagnostic
+        .spans
+        .iter()
+        .filter(|span| span.is_primary && span.expansion.is_none())
+        .filter(|span| {
+            let path = std::path::Path::new(&span.file_name);
+            path == source_path || path == std::path::Path::new("src/main.rs")
+        })
+        .map(|span| (span.byte_start as usize, span.byte_end as usize))
+        .collect()
 }
 
-/// Remove a diagnostic candidate only when its kind/name pair identifies one
-/// AST item in the whole bundle. This deliberately gives up some size savings
-/// for duplicate names rather than risking removal from the wrong module.
 fn remove_unique_candidates(file: &mut File, candidates: &HashSet<Candidate>) -> usize {
-    let removable = removable_candidates(file, candidates);
+    let removable = removable_candidates(
+        file,
+        &candidates
+            .iter()
+            .map(|candidate| candidate.byte_range)
+            .collect(),
+        0,
+    );
     remove_items(&mut file.items, &removable)
 }
 
-fn removable_candidates(file: &File, candidates: &HashSet<Candidate>) -> HashSet<Candidate> {
-    let mut counts = HashMap::<Candidate, usize>::new();
-    count_items(&file.items, &mut counts);
+fn removable_candidates(
+    file: &File,
+    dead_spans: &HashSet<(usize, usize)>,
+    span_offset: usize,
+) -> HashSet<Candidate> {
+    let mut available = Vec::new();
+    collect_candidates(&file.items, &mut available);
     let mut impl_types = HashSet::new();
     collect_impl_types(&file.items, &mut impl_types);
-    candidates
-        .iter()
-        .filter(|candidate| counts.get(*candidate) == Some(&1))
+    available
+        .into_iter()
         .filter(|candidate| {
-            !matches!(
-                candidate.kind,
-                ItemKind::Struct | ItemKind::Enum | ItemKind::TypeAlias
-            ) || !impl_types.contains(&candidate.name)
+            dead_spans.contains(&(
+                candidate.byte_range.0 + span_offset,
+                candidate.byte_range.1 + span_offset,
+            )) && item_is_removable(&file.items, candidate)
+                && (!matches!(
+                    candidate.kind,
+                    ItemKind::Struct | ItemKind::Enum | ItemKind::TypeAlias
+                ) || !impl_types.contains(&candidate.name))
         })
-        .filter(|candidate| item_is_removable(&file.items, candidate))
-        .cloned()
         .collect()
 }
 
@@ -270,6 +282,7 @@ fn item_is_removable(items: &[Item], candidate: &Candidate) -> bool {
     items.iter().any(|item| {
         item_candidate(item).as_ref() == Some(candidate) && item_is_safe_to_remove(item)
             || matches!(item, Item::Mod(module) if module.content.as_ref().is_some_and(|(_, nested)| item_is_removable(nested, candidate)))
+            || matches!(item, Item::Impl(implementation) if implementation.trait_.is_none() && attrs_are_safe(&implementation.attrs) && implementation.items.iter().any(|member| impl_candidate(member).as_ref() == Some(candidate) && impl_item_is_safe(member)))
     })
 }
 
@@ -293,15 +306,23 @@ fn collect_impl_types(items: &[Item], names: &mut HashSet<String>) {
     }
 }
 
-fn count_items(items: &[Item], counts: &mut HashMap<Candidate, usize>) {
+fn collect_candidates(items: &[Item], out: &mut Vec<Candidate>) {
     for item in items {
         if let Some(candidate) = item_candidate(item) {
-            *counts.entry(candidate).or_default() += 1;
+            out.push(candidate);
         }
-        if let Item::Mod(module) = item
-            && let Some((_, nested)) = &module.content
-        {
-            count_items(nested, counts);
+        match item {
+            Item::Mod(module) => {
+                if let Some((_, nested)) = &module.content {
+                    collect_candidates(nested, out);
+                }
+            }
+            Item::Impl(implementation)
+                if implementation.trait_.is_none() && attrs_are_safe(&implementation.attrs) =>
+            {
+                out.extend(implementation.items.iter().filter_map(impl_candidate));
+            }
+            _ => {}
         }
     }
 }
@@ -309,41 +330,76 @@ fn count_items(items: &[Item], counts: &mut HashMap<Candidate, usize>) {
 fn remove_items(items: &mut Vec<Item>, candidates: &HashSet<Candidate>) -> usize {
     let mut removed = 0;
     let mut kept = Vec::with_capacity(items.len());
-
     for mut item in items.drain(..) {
-        let should_remove = item_candidate(&item)
-            .is_some_and(|candidate| candidates.contains(&candidate))
-            && item_is_safe_to_remove(&item);
-
-        if should_remove {
+        if item_candidate(&item).is_some_and(|candidate| candidates.contains(&candidate))
+            && item_is_safe_to_remove(&item)
+        {
             removed += 1;
             continue;
         }
-
-        if let Item::Mod(module) = &mut item
-            && let Some((_, nested)) = &mut module.content
-        {
-            removed += remove_items(nested, candidates);
+        match &mut item {
+            Item::Mod(module) => {
+                if let Some((_, nested)) = &mut module.content {
+                    removed += remove_items(nested, candidates);
+                }
+            }
+            Item::Impl(implementation)
+                if implementation.trait_.is_none() && attrs_are_safe(&implementation.attrs) =>
+            {
+                let before = implementation.items.len();
+                implementation.items.retain(|member| {
+                    !impl_candidate(member).is_some_and(|candidate| candidates.contains(&candidate))
+                        || !impl_item_is_safe(member)
+                });
+                removed += before - implementation.items.len();
+                if implementation.items.is_empty() && attrs_are_safe(&implementation.attrs) {
+                    continue;
+                }
+            }
+            _ => {}
         }
         kept.push(item);
     }
-
     *items = kept;
     removed
 }
 
+fn ident_candidate(kind: ItemKind, ident: &syn::Ident) -> Candidate {
+    let range = ident.span().byte_range();
+    Candidate {
+        kind,
+        name: ident.to_string(),
+        byte_range: (range.start, range.end),
+    }
+}
+
 fn item_candidate(item: &Item) -> Option<Candidate> {
-    let (kind, name) = match item {
-        Item::Fn(item) => (ItemKind::Function, item.sig.ident.to_string()),
-        Item::Const(item) => (ItemKind::Constant, item.ident.to_string()),
-        Item::Static(item) => (ItemKind::Static, item.ident.to_string()),
-        Item::Struct(item) => (ItemKind::Struct, item.ident.to_string()),
-        Item::Enum(item) => (ItemKind::Enum, item.ident.to_string()),
-        Item::Type(item) => (ItemKind::TypeAlias, item.ident.to_string()),
-        Item::Mod(item) => (ItemKind::Module, item.ident.to_string()),
+    Some(match item {
+        Item::Fn(item) => ident_candidate(ItemKind::Function, &item.sig.ident),
+        Item::Const(item) => ident_candidate(ItemKind::Constant, &item.ident),
+        Item::Static(item) => ident_candidate(ItemKind::Static, &item.ident),
+        Item::Struct(item) => ident_candidate(ItemKind::Struct, &item.ident),
+        Item::Enum(item) => ident_candidate(ItemKind::Enum, &item.ident),
+        Item::Type(item) => ident_candidate(ItemKind::TypeAlias, &item.ident),
+        Item::Mod(item) => ident_candidate(ItemKind::Module, &item.ident),
         _ => return None,
-    };
-    Some(Candidate { kind, name })
+    })
+}
+
+fn impl_candidate(item: &syn::ImplItem) -> Option<Candidate> {
+    Some(match item {
+        syn::ImplItem::Fn(item) => ident_candidate(ItemKind::Method, &item.sig.ident),
+        syn::ImplItem::Const(item) => ident_candidate(ItemKind::AssociatedConstant, &item.ident),
+        _ => return None,
+    })
+}
+
+fn impl_item_is_safe(item: &syn::ImplItem) -> bool {
+    match item {
+        syn::ImplItem::Fn(item) => attrs_are_safe(&item.attrs),
+        syn::ImplItem::Const(item) => attrs_are_safe(&item.attrs),
+        _ => false,
+    }
 }
 
 fn item_is_safe_to_remove(item: &Item) -> bool {
@@ -429,7 +485,7 @@ fn attrs_are_safe(attrs: &[Attribute]) -> bool {
 
 struct CheckResult {
     success: bool,
-    dead_items: HashSet<Candidate>,
+    dead_items: HashSet<(usize, usize)>,
     errors: String,
 }
 
@@ -438,6 +494,13 @@ struct WorkDir {
 }
 
 impl WorkDir {
+    fn target_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("minify directory has a UTF-8 name")
+    }
+
     fn finish(&self, mut result: Minified) -> Result<Minified> {
         // Restore last-good source after a rejected batch, and validate with
         // ordinary lint settings: --force-warn would override deny(dead_code).
@@ -446,6 +509,7 @@ impl WorkDir {
             .args(["check", "--quiet"])
             .arg("--manifest-path")
             .arg(self.path.join("Cargo.toml"))
+            .args(["--bin", self.target_name()])
             .current_dir(&self.path)
             .output()
             .context("failed to execute final minify validation")?;
@@ -491,8 +555,11 @@ impl WorkDir {
     fn prepare(&self, manifest: &str) -> Result<()> {
         fs::create_dir(self.path.join("src"))
             .with_context(|| format!("failed to create {}/src", self.path.display()))?;
-        fs::write(self.path.join("Cargo.toml"), manifest)
-            .with_context(|| format!("failed to write {}/Cargo.toml", self.path.display()))
+        fs::write(
+            self.path.join("Cargo.toml"),
+            crate::check::manifest_for_target(manifest, self.target_name()),
+        )
+        .with_context(|| format!("failed to write {}/Cargo.toml", self.path.display()))
     }
 
     fn write_source(&self, source: &str) -> Result<()> {
@@ -503,36 +570,18 @@ impl WorkDir {
     fn check(&self) -> Result<CheckResult> {
         let mut command = Command::new("cargo");
         command
-            .arg("check")
+            .arg("rustc")
             .arg("--quiet")
+            .args(["--profile", "check"])
             .arg("--message-format=json")
             .arg("--manifest-path")
             .arg(self.path.join("Cargo.toml"))
+            .args(["--bin", self.target_name(), "--", "--force-warn=dead_code"])
             .current_dir(&self.path);
-        append_dead_code_rustflag(&mut command);
         let output = command
             .output()
             .context("failed to execute cargo check for --minify")?;
-        parse_check_output(&output)
-    }
-}
-
-fn append_dead_code_rustflag(command: &mut Command) {
-    const FORCE_DEAD_CODE: &str = "--force-warn=dead_code";
-
-    if let Some(mut flags) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
-        if !flags.is_empty() {
-            flags.push("\x1f");
-        }
-        flags.push(FORCE_DEAD_CODE);
-        command.env("CARGO_ENCODED_RUSTFLAGS", flags);
-    } else {
-        let mut flags = std::env::var_os("RUSTFLAGS").unwrap_or_default();
-        if !flags.is_empty() {
-            flags.push(" ");
-        }
-        flags.push(FORCE_DEAD_CODE);
-        command.env("RUSTFLAGS", flags);
+        parse_check_output(&output, self.target_name(), &self.path.join("src/main.rs"))
     }
 }
 
@@ -548,7 +597,11 @@ impl Drop for WorkDir {
     }
 }
 
-fn parse_check_output(output: &Output) -> Result<CheckResult> {
+fn parse_check_output(
+    output: &Output,
+    target_name: &str,
+    source_path: &std::path::Path,
+) -> Result<CheckResult> {
     let mut dead_items = HashSet::new();
     let mut errors = String::new();
     let reader = BufReader::new(Cursor::new(&output.stdout));
@@ -558,10 +611,8 @@ fn parse_check_output(output: &Output) -> Result<CheckResult> {
         let Message::CompilerMessage(message) = message else {
             continue;
         };
-        if message.target.name == "splicedown-check"
-            && let Some(candidate) = candidate_from_diagnostic(&message.message)
-        {
-            dead_items.insert(candidate);
+        if message.target.name == target_name {
+            dead_items.extend(dead_spans(&message.message, source_path));
         }
         if matches!(
             message.message.level,
@@ -587,12 +638,15 @@ fn parse_check_output(output: &Output) -> Result<CheckResult> {
 mod tests {
     use super::*;
 
-    fn candidates(entries: &[(ItemKind, &str)]) -> HashSet<Candidate> {
-        entries
-            .iter()
-            .map(|(kind, name)| Candidate {
-                kind: *kind,
-                name: (*name).to_owned(),
+    fn candidates(file: &File, entries: &[(ItemKind, &str)]) -> HashSet<Candidate> {
+        let mut available = Vec::new();
+        collect_candidates(&file.items, &mut available);
+        available
+            .into_iter()
+            .filter(|candidate| {
+                entries
+                    .iter()
+                    .any(|(kind, name)| candidate.kind == *kind && candidate.name == *name)
             })
             .collect()
     }
@@ -612,17 +666,20 @@ mod tests {
             "#,
         )
         .unwrap();
-        let dead = candidates(&[
-            (ItemKind::Function, "dead"),
-            (ItemKind::Function, "duplicate"),
-            (ItemKind::Function, "exported"),
-            (ItemKind::Static, "REGISTER"),
-        ]);
+        let dead = candidates(
+            &file,
+            &[
+                (ItemKind::Function, "dead"),
+                (ItemKind::Function, "duplicate"),
+                (ItemKind::Function, "exported"),
+                (ItemKind::Static, "REGISTER"),
+            ],
+        );
 
-        assert_eq!(remove_unique_candidates(&mut file, &dead), 1);
+        assert_eq!(remove_unique_candidates(&mut file, &dead), 3);
         let output = prettyplease::unparse(&file);
         assert!(!output.contains("fn dead"));
-        assert_eq!(output.matches("fn duplicate").count(), 2);
+        assert_eq!(output.matches("fn duplicate").count(), 0);
         assert!(output.contains("fn exported"));
         assert!(output.contains("static REGISTER"));
     }
@@ -669,7 +726,7 @@ mod tests {
             "mod behavior { struct S; impl S { fn new() -> Self { S } } } fn main() {}",
         )
         .unwrap();
-        let dead = candidates(&[(ItemKind::Module, "behavior")]);
+        let dead = candidates(&file, &[(ItemKind::Module, "behavior")]);
 
         assert_eq!(remove_unique_candidates(&mut file, &dead), 0);
         assert!(prettyplease::unparse(&file).contains("mod behavior"));
@@ -681,12 +738,24 @@ mod tests {
             "struct S; impl S { fn new() -> Self { S } } fn dead() {} fn main() {}",
         )
         .unwrap();
-        let dead = candidates(&[(ItemKind::Struct, "S"), (ItemKind::Function, "dead")]);
+        let dead = candidates(
+            &file,
+            &[(ItemKind::Struct, "S"), (ItemKind::Function, "dead")],
+        );
 
         assert_eq!(remove_unique_candidates(&mut file, &dead), 1);
         let output = prettyplease::unparse(&file);
         assert!(output.contains("struct S"));
         assert!(!output.contains("fn dead"));
+    }
+
+    #[test]
+    fn does_not_remove_members_from_an_attributed_impl() {
+        let mut file =
+            syn::parse_file("struct S; #[unknown_attribute] impl S { fn dead() {} }").unwrap();
+        let dead = candidates(&file, &[(ItemKind::Method, "dead")]);
+        assert_eq!(remove_unique_candidates(&mut file, &dead), 0);
+        assert!(prettyplease::unparse(&file).contains("fn dead"));
     }
 
     #[test]
@@ -727,6 +796,57 @@ mod tests {
     }
 
     #[test]
+    fn minifies_source_with_a_shebang() {
+        for shebang in [
+            "#!/usr/bin/env rust-script",
+            "#!/usr/bin/env rust-script 日本語",
+        ] {
+            let source =
+                format!("{shebang}\n#![allow(dead_code)]\nfn dead() {{}}\nfn main() {{}}\n");
+            let result = run(
+                &source,
+                "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+                Options { dead_code: true, test_code: false },
+            ).unwrap();
+            assert!(result.source.starts_with(&format!("{shebang}\n")));
+            assert!(!result.source.contains("fn dead"), "{}", result.source);
+            assert!(result.source.contains("fn main"));
+            assert_eq!(result.removed_items, 1);
+            assert_eq!(result.passes, 3);
+        }
+    }
+
+    #[test]
+    fn shared_target_directory_checks_each_generated_source() {
+        let shared = WorkDir::create().unwrap();
+        let valid = WorkDir::create().unwrap();
+        let invalid = WorkDir::create().unwrap();
+        let manifest = "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n";
+        for work in [&valid, &invalid] {
+            work.prepare(manifest).unwrap();
+            fs::create_dir(work.path.join(".cargo")).unwrap();
+            // Both source files exist before the first compilation. Without
+            // distinct bin names Cargo can consider the second crate fresh.
+            fs::write(
+                work.path.join(".cargo/config.toml"),
+                format!(
+                    "[build]\ntarget-dir = \"../{}/target\"\n",
+                    shared.target_name()
+                ),
+            )
+            .unwrap();
+        }
+        valid.write_source("fn main() {}\n").unwrap();
+        invalid
+            .write_source("fn main() { missing_symbol(); }\n")
+            .unwrap();
+        assert!(valid.check().unwrap().success);
+        let result = invalid.check().unwrap();
+        assert!(!result.success);
+        assert!(result.errors.contains("missing_symbol"));
+    }
+
+    #[test]
     fn batches_independent_candidates_without_rechecking_the_same_source() {
         let mut source = String::from("#![allow(dead_code)]\nfn main() {}\n");
         for n in 0..20 {
@@ -757,7 +877,7 @@ mod tests {
         let result = run(&source,
             "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
             Options { dead_code: true, test_code: false }).unwrap();
-        assert_eq!(result.removed_items, 1);
+        assert_eq!(result.removed_items, 21);
         assert_eq!(result.passes, 3);
     }
 
@@ -774,8 +894,9 @@ mod tests {
         let source = r#"
             #![allow(dead_code)]
             const TRANSITIVE: usize = 1;
+            trait T { fn value() -> usize; }
             struct Holder;
-            impl Holder { fn dead() -> usize { TRANSITIVE } }
+            impl T for Holder { fn value() -> usize { TRANSITIVE } }
             fn removable() {}
             fn main() {}
         "#;
@@ -799,8 +920,100 @@ mod tests {
 
         assert_eq!(result.removed_items, 1);
         assert!(result.source.contains("const TRANSITIVE"));
-        assert!(result.source.contains("impl Holder"));
+        assert!(result.source.contains("impl T for Holder"));
         assert!(!result.source.contains("fn removable"));
+    }
+
+    #[test]
+    fn preserves_referenced_empty_module_namespaces() {
+        let manifest = "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n";
+        for module in ["mod empty {}", "mod empty { fn dead_member() {} }"] {
+            let source = format!(
+                "#![allow(dead_code, unused_imports)]\n{module}\nmod child {{ pub fn live() {{ use crate::empty; }} }}\nfn dead() {{}}\nfn main() {{ child::live(); }}"
+            );
+            let result = run(
+                &source,
+                manifest,
+                Options {
+                    dead_code: true,
+                    test_code: false,
+                },
+            )
+            .unwrap();
+            assert!(result.source.contains("mod empty"), "{}", result.source);
+            assert!(
+                result.source.contains("use crate::empty"),
+                "{}",
+                result.source
+            );
+            assert!(!result.source.contains("fn dead_member"));
+            assert!(!result.source.contains("fn dead()"));
+        }
+    }
+
+    #[test]
+    fn removes_dead_names_and_inherent_members_individually() {
+        let source = r#"
+            #![allow(dead_code)]
+            mod left { pub fn same() {} }
+            mod right { fn same() {} }
+            struct Used;
+            impl Used {
+                fn live() -> usize { Self::VALUE }
+                const VALUE: usize = 7;
+                fn dead() -> usize { Self::DEAD_VALUE }
+                const DEAD_VALUE: usize = 8;
+            }
+            fn main() { left::same(); assert_eq!(Used::live(), 7); }
+        "#;
+        let result = run(source,
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: true, test_code: false }).unwrap();
+        assert!(result.source.contains("mod right"));
+        assert!(result.source.contains("mod right {}"), "{}", result.source);
+        assert!(result.source.contains("mod left"));
+        assert!(result.source.contains("fn live"));
+        assert!(result.source.contains("const VALUE"));
+        assert!(!result.source.contains("fn dead"));
+        assert!(!result.source.contains("const DEAD_VALUE"));
+    }
+
+    #[test]
+    fn diagnostic_locations_handle_unicode_raw_identifiers_and_macro_expansions() {
+        let source = r#"
+            #![allow(dead_code)]
+            macro_rules! generated { () => { fn r#unused() {} }; }
+            generated!();
+            mod 名前 { pub fn r#type() {} fn r#unused() {} }
+            fn main() { 名前::r#type(); }
+        "#;
+        let result = run(source,
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: true, test_code: false }).unwrap();
+        assert!(result.source.contains("generated!"));
+        assert!(result.source.contains("r#type"));
+        assert!(!result.source.contains("fn r#unused() {}\n}"));
+    }
+
+    #[test]
+    fn removes_every_method_in_a_combined_dead_code_diagnostic() {
+        let source = r#"
+            #![allow(dead_code)]
+            struct S;
+            impl S {
+                fn first() {}
+                fn second() {}
+                fn third() {}
+                const VALUE: usize = 3;
+            }
+            fn main() {}
+        "#;
+        let result = run(source,
+            "[package]\nname=\"splicedown-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n",
+            Options { dead_code: true, test_code: false }).unwrap();
+        assert_eq!(result.removed_items, 5);
+        assert!(!result.source.contains("impl S"));
+        assert!(!result.source.contains("struct S"));
     }
 
     #[test]
