@@ -39,12 +39,12 @@ pub(crate) struct Cli {
     /// Enable compiler-confirmed dead-code removal (enabled by default)
     #[arg(
         long,
-        overrides_with_all = ["no_minify", "no_minify_test"]
+        overrides_with_all = ["no_minify", "no_minify_test", "no_minify_comment"]
     )]
     pub(crate) minify: bool,
 
-    /// Disable minification, including test-only removal unless re-enabled
-    /// with --minify-test
+    /// Disable minification, including test-only and doc-comment removal
+    /// unless re-enabled with --minify-test or --minify-comment
     #[arg(long, overrides_with = "minify")]
     pub(crate) no_minify: bool,
 
@@ -55,6 +55,14 @@ pub(crate) struct Cli {
     /// Disable removal of test-only items
     #[arg(long, overrides_with = "minify_test")]
     pub(crate) no_minify_test: bool,
+
+    /// Enable removal of documentation comments (enabled by default)
+    #[arg(long, overrides_with = "no_minify_comment")]
+    pub(crate) minify_comment: bool,
+
+    /// Disable removal of documentation comments
+    #[arg(long, overrides_with = "minify_comment")]
+    pub(crate) no_minify_comment: bool,
 
     /// Skip the post-bundle `cargo check`
     #[arg(long)]
@@ -79,6 +87,14 @@ impl Cli {
             self.minify_test
         } else {
             !self.no_minify_test
+        }
+    }
+
+    pub(crate) fn minify_comment_enabled(&self) -> bool {
+        if self.no_minify {
+            self.minify_comment
+        } else {
+            !self.no_minify_comment
         }
     }
 }
@@ -128,15 +144,22 @@ mod tests {
         let default = Cli::try_parse_from(["splicedown"]).unwrap();
         let no_dead = Cli::try_parse_from(["splicedown", "--no-minify"]).unwrap();
         let no_tests = Cli::try_parse_from(["splicedown", "--no-minify-test"]).unwrap();
+        let no_comments = Cli::try_parse_from(["splicedown", "--no-minify-comment"]).unwrap();
         let neither =
             Cli::try_parse_from(["splicedown", "--no-minify", "--no-minify-test"]).unwrap();
 
         assert!(default.minify_enabled());
         assert!(default.minify_test_enabled());
+        assert!(default.minify_comment_enabled());
         assert!(!no_dead.minify_enabled());
         assert!(!no_dead.minify_test_enabled());
+        assert!(!no_dead.minify_comment_enabled());
         assert!(no_tests.minify_enabled());
         assert!(!no_tests.minify_test_enabled());
+        assert!(no_tests.minify_comment_enabled());
+        assert!(no_comments.minify_enabled());
+        assert!(no_comments.minify_test_enabled());
+        assert!(!no_comments.minify_comment_enabled());
         assert!(!neither.minify_enabled());
         assert!(!neither.minify_test_enabled());
     }
@@ -154,6 +177,7 @@ mod tests {
 
         assert!(cli.minify_enabled());
         assert!(cli.minify_test_enabled());
+        assert!(cli.minify_comment_enabled());
     }
 
     #[test]
@@ -163,14 +187,32 @@ mod tests {
         assert!(minify_last.minify_enabled());
         assert!(minify_last.minify_test_enabled());
 
+        let comment_last =
+            Cli::try_parse_from(["splicedown", "--no-minify-comment", "--minify"]).unwrap();
+        assert!(comment_last.minify_enabled());
+        assert!(comment_last.minify_comment_enabled());
+
         let test_only =
             Cli::try_parse_from(["splicedown", "--no-minify", "--minify-test"]).unwrap();
         assert!(!test_only.minify_enabled());
         assert!(test_only.minify_test_enabled());
 
+        let comment_only =
+            Cli::try_parse_from(["splicedown", "--no-minify", "--minify-comment"]).unwrap();
+        assert!(!comment_only.minify_enabled());
+        assert!(!comment_only.minify_test_enabled());
+        assert!(comment_only.minify_comment_enabled());
+
         let no_tests_last =
             Cli::try_parse_from(["splicedown", "--minify", "--no-minify-test"]).unwrap();
         assert!(no_tests_last.minify_enabled());
         assert!(!no_tests_last.minify_test_enabled());
+
+        // A disable flag that comes after --minify still wins, so keeping the
+        // doc comments of a minified bundle is possible.
+        let disable_after =
+            Cli::try_parse_from(["splicedown", "--minify", "--no-minify-comment"]).unwrap();
+        assert!(disable_after.minify_enabled());
+        assert!(!disable_after.minify_comment_enabled());
     }
 }

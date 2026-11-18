@@ -17,8 +17,12 @@
 - 出力コードの最適化
     - minify 機能を利用して、安全にツリーシェイキングを行うことができます。
     - 未使用の依存の展開を省き、同名の項目や未使用メソッドも個別に削除します。詳しくは [EX02: minify の動作と検証](docs/EX02_minify.md) を参照してください。
+    - さらに、未使用の `union`・`trait`・`macro_rules!`、`use` の未使用パス、空になった `mod`、参照されないルートの `pub` 項目も削除し、依存モジュール名を短縮します。
+    - さらに、doc コメント（`///`、`//!`、`#[doc]`）も削除します（`--no-minify-comment` で保持できます）。
     - バンドル結果で使われることの少ないテストコード (`#[cfg(test)]` などの属性がついているコード)
       を削除することも可能です。これにより、バンドル結果のサイズを大幅に削減することができます。
+    - minify の出力は、残った定義が元のバンドルの定義と同じであること、消えた定義がすべて記録されていること、
+      そして通常の lint 設定で `cargo check` を通ることを毎回検証します。検証に失敗した場合は出力しません。
 
 ## Installation
 
@@ -31,7 +35,7 @@ cargo binstall --locked --git https://github.com/Yu-yu0202/splicedown.git
 ## Usage
 
 ```bash
-splicedown <entry_file> [--manifest-path <PATH>] [--output <PATH>] [--exclude <CRATE(s)>] [--exclude-preset <PRESET(s)>] [--(no-)minify] [--(no-)minify-test] [--no-check] [--keep-check-dir]
+splicedown <entry_file> [--manifest-path <PATH>] [--output <PATH>] [--exclude <CRATE(s)>] [--exclude-preset <PRESET(s)>] [--(no-)minify] [--(no-)minify-test] [--(no-)minify-comment] [--no-check] [--keep-check-dir]
 ```
 
 - `<entry_file>`: バンドルのエントリーポイントとなる Rust ファイルのパスを指定します。
@@ -53,6 +57,10 @@ splicedown <entry_file> [--manifest-path <PATH>] [--output <PATH>] [--exclude <C
 - `--(no-)minify-test`: バンドル結果からテストコードを削除するかどうかを指定します。
     - デフォルトは有効です。
     - `--no-minify-test` を指定すると、テストコードを削除しないようにすることができます。
+- `--(no-)minify-comment`: バンドル結果から doc コメント（`///`、`//!`、`#[doc]`）を削除するかどうかを指定します。
+    - デフォルトは有効です。
+    - `--no-minify-comment` を指定すると、doc コメントを削除しないようにすることができます。
+    - doc コメントは rustdoc 専用の情報なので、削除してもプログラムの動作は変わりません（検証でも確認されます）。
 - `--no-check`: バンドル前の `cargo check` の実行をスキップします。
     - デフォルトは無効です。
     - 有効でも、minify 時の安全性チェックとして行われる check はスキップされません。
